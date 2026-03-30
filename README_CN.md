@@ -6,6 +6,63 @@
 
 所有的第三方供应商支持都由第三方社区维护者提供，CLIProxyAPI 不提供技术支持。如需取得支持，请与对应的社区维护者联系。
 
+## 凭证级 RPM 限流
+
+CLIProxyAPI Plus 支持按凭证的 RPM（每分钟请求数）限流。当某个凭证的 RPM 达到阈值时，调度器自动跳过该凭证选择下一个可用凭证。当所有凭证都被限流时，代理返回 HTTP 429 并附带 `Retry-After` 头。
+
+### 快速开始
+
+在 `config.yaml` 中添加：
+
+```yaml
+# 全局默认：每个凭证每分钟最大请求数（0 = 不限制）
+default-rpm: 60
+```
+
+### 单凭证覆盖
+
+单个凭证可以通过设置 `rpm_limit` 属性覆盖全局默认值：
+
+```yaml
+gemini-api-key:
+  - api-key: "your-key-here"
+    rpm_limit: "30"     # 该凭证：最多 30 次/分钟
+    priority: 1
+```
+
+### 工作原理
+
+- **滑动窗口算法**：在 60 秒窗口内按凭证跟踪请求时间戳
+- **调度器集成**：RPM 耗尽的凭证在选择时被自动跳过
+- **执行器双重检查**：执行前的二次检查确保并发安全
+- **自动恢复**：请求滑出窗口后凭证自动恢复可用
+- **零配置默认**：`rpm_limit=0` 或未设置表示不限制（完全向后兼容）
+
+### 配置参考
+
+| 配置项 | 位置 | 类型 | 默认值 | 说明 |
+|--------|------|------|--------|------|
+| `default-rpm` | `config.yaml` | int | `0` | 所有凭证的全局默认 RPM 限制。`0` = 不限制 |
+| `rpm_limit` | 凭证 attributes | string | — | 单凭证覆盖，优先于 `default-rpm` |
+
+### 管理 API
+
+查询所有凭证的当前 RPM 状态：
+
+```bash
+GET /v0/management/rpm-stats
+```
+
+返回每个凭证的当前请求计数、配置限制和重试等待时间。
+
+### 可观测性
+
+当凭证触发 RPM 限流时，输出警告日志：
+
+```
+WARN RPM limit reached for credential  auth_id=xxx provider=gemini rpm_limit=60 current_rpm=60 retry_after_seconds=45
+```
+
 ## 贡献
 
 该项目仅接受第三方供应商支持的 Pull Request。任何非第三方供应商支持的 Pull Request 都将被拒绝。
