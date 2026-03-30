@@ -23,14 +23,32 @@ default-rpm: 60
 
 ### Per-Credential Override
 
-Individual credentials can override the global default by setting the `rpm_limit` attribute:
+Individual credentials can have their own RPM limit by setting the `rpm_limit` attribute in the credential's auth JSON file (under the `auths/` directory):
 
-```yaml
-gemini-api-key:
-  - api-key: "your-key-here"
-    rpm_limit: "30"     # This credential: max 30 req/min
-    priority: 1
+```json
+{
+  "id": "gemini:apikey:xxxx",
+  "provider": "gemini",
+  "attributes": {
+    "api_key": "AIzaSy...",
+    "rpm_limit": "30"
+  }
+}
 ```
+
+Or via the Management API:
+
+```bash
+# Set RPM limit for a specific credential
+PATCH /v0/management/auths/{auth_id}
+{
+  "attributes": {
+    "rpm_limit": "30"
+  }
+}
+```
+
+When `rpm_limit` is set on a credential, it takes priority over the global `default-rpm`.
 
 ### How It Works
 

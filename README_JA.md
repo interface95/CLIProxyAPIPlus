@@ -56,14 +56,32 @@ default-rpm: 60
 
 ### 資格情報ごとのオーバーライド
 
-個別の資格情報は`rpm_limit`属性を設定してグローバルデフォルトをオーバーライドできます：
+個別の資格情報は、auth JSONファイル（`auths/`ディレクトリ内）で`rpm_limit`属性を設定してグローバルデフォルトをオーバーライドできます：
 
-```yaml
-gemini-api-key:
-  - api-key: "your-key-here"
-    rpm_limit: "30"     # この資格情報：最大30リクエスト/分
-    priority: 1
+```json
+{
+  "id": "gemini:apikey:xxxx",
+  "provider": "gemini",
+  "attributes": {
+    "api_key": "AIzaSy...",
+    "rpm_limit": "30"
+  }
+}
 ```
+
+または管理APIで設定：
+
+```bash
+# 特定の資格情報にRPM制限を設定
+PATCH /v0/management/auths/{auth_id}
+{
+  "attributes": {
+    "rpm_limit": "30"
+  }
+}
+```
+
+資格情報に`rpm_limit`が設定されている場合、グローバルの`default-rpm`より優先されます。
 
 ### 仕組み
 

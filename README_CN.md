@@ -21,14 +21,32 @@ default-rpm: 60
 
 ### 单凭证覆盖
 
-单个凭证可以通过设置 `rpm_limit` 属性覆盖全局默认值：
+单个凭证可以通过在 auth JSON 文件（`auths/` 目录下）中设置 `rpm_limit` 属性来覆盖全局默认值：
 
-```yaml
-gemini-api-key:
-  - api-key: "your-key-here"
-    rpm_limit: "30"     # 该凭证：最多 30 次/分钟
-    priority: 1
+```json
+{
+  "id": "gemini:apikey:xxxx",
+  "provider": "gemini",
+  "attributes": {
+    "api_key": "AIzaSy...",
+    "rpm_limit": "30"
+  }
+}
 ```
+
+或通过管理 API 设置：
+
+```bash
+# 为指定凭证设置 RPM 限制
+PATCH /v0/management/auths/{auth_id}
+{
+  "attributes": {
+    "rpm_limit": "30"
+  }
+}
+```
+
+当凭证设置了 `rpm_limit` 时，优先于全局 `default-rpm`。
 
 ### 工作原理
 
