@@ -75,6 +75,9 @@ type Config struct {
 	MaxRetryCredentials int `yaml:"max-retry-credentials" json:"max-retry-credentials"`
 	// MaxRetryInterval defines the maximum wait time in seconds before retrying a cooled-down credential.
 	MaxRetryInterval int `yaml:"max-retry-interval" json:"max-retry-interval"`
+	// DefaultRPM defines the default maximum requests per minute per credential.
+	// Set to 0 (default) for unlimited. Individual credentials can override via auth attributes: rpm_limit.
+	DefaultRPM int `yaml:"default-rpm" json:"default-rpm"`
 
 	// QuotaExceeded defines the behavior when a quota is exceeded.
 	QuotaExceeded QuotaExceeded `yaml:"quota-exceeded" json:"quota-exceeded"`

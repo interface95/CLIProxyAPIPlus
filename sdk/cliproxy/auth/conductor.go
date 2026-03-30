@@ -156,6 +156,8 @@ type Manager struct {
 	// runtimeConfig stores the latest application config for request-time decisions.
 	// It is initialized in NewManager; never Load() before first Store().
 	runtimeConfig atomic.Value
+	rpmLimiter    *RPMLimiter
+	rpmCleanupEnd context.CancelFunc
 
 	// Optional HTTP RoundTripper provider injected by host.
 	rtProvider RoundTripperProvider
@@ -173,6 +175,10 @@ func NewManager(store Store, selector Selector, hook Hook) *Manager {
 	if hook == nil {
 		hook = NoopHook{}
 	}
+	limiter := NewRPMLimiter()
+	rpmCleanupCtx, rpmCleanupEnd := context.WithCancel(context.Background())
+	limiter.StartCleanup(rpmCleanupCtx)
+
 	manager := &Manager{
 		store:            store,
 		executors:        make(map[string]ProviderExecutor),
@@ -182,11 +188,13 @@ func NewManager(store Store, selector Selector, hook Hook) *Manager {
 		providerOffsets:  make(map[string]int),
 		modelPoolOffsets: make(map[string]int),
 		refreshSemaphore: make(chan struct{}, refreshMaxConcurrency),
+		rpmLimiter:       limiter,
+		rpmCleanupEnd:    rpmCleanupEnd,
 	}
 	// atomic.Value requires non-nil initial value.
 	manager.runtimeConfig.Store(&internalconfig.Config{})
 	manager.apiKeyModelAlias.Store(apiKeyModelAliasTable(nil))
-	manager.scheduler = newAuthScheduler(selector)
+	manager.scheduler = newAuthScheduler(selector, limiter, 0)
 	return manager
 }
 
@@ -273,6 +281,9 @@ func (m *Manager) SetConfig(cfg *internalconfig.Config) {
 		cfg = &internalconfig.Config{}
 	}
 	m.runtimeConfig.Store(cfg)
+	if m.scheduler != nil {
+		m.scheduler.setDefaultRPM(cfg.DefaultRPM)
+	}
 	m.rebuildAPIKeyModelAliasFromRuntimeConfig()
 }
 
@@ -1087,6 +1098,19 @@ func (m *Manager) executeMixedOnce(ctx context.Context, providers []string, req 
 				return cliproxyexecutor.Response{}, lastErr
 			}
 			return cliproxyexecutor.Response{}, errPick
+		}
+
+		limit := m.resolveRPMLimit(auth)
+		if limit > 0 && m.rpmLimiter != nil && !m.rpmLimiter.Allow(auth.ID, limit) {
+			log.WithFields(log.Fields{
+				"auth_id":             auth.ID,
+				"provider":            provider,
+				"rpm_limit":           limit,
+				"current_rpm":         m.rpmLimiter.Count(auth.ID),
+				"retry_after_seconds": m.rpmLimiter.RetryAfter(auth.ID, limit).Seconds(),
+			}).Warn("RPM limit reached for credential")
+			tried[auth.ID] = struct{}{}
+			continue
 		}
 
 		entry := logEntryWithRequestID(ctx)
@@ -1999,7 +2023,8 @@ func retryAfterFromError(err error) *time.Duration {
 	if retryAfter == nil {
 		return nil
 	}
-	return new(*retryAfter)
+	value := *retryAfter
+	return &value
 }
 
 func statusCodeFromResult(err *Error) int {
@@ -2160,6 +2185,29 @@ func (m *Manager) List() []*Auth {
 		list = append(list, auth.Clone())
 	}
 	return list
+}
+
+func (m *Manager) RPMStats() map[string]RPMStats {
+	if m == nil || m.rpmLimiter == nil {
+		return map[string]RPMStats{}
+	}
+
+	defaultLimit := m.resolveRPMLimit(nil)
+	auths := m.List()
+	limitByAuthID := make(map[string]int, len(auths))
+	for _, auth := range auths {
+		if auth == nil {
+			continue
+		}
+		limitByAuthID[auth.ID] = m.resolveRPMLimit(auth)
+	}
+
+	return m.rpmLimiter.Stats(func(authID string) int {
+		if limit, ok := limitByAuthID[authID]; ok {
+			return limit
+		}
+		return defaultLimit
+	})
 }
 
 // GetByID retrieves an auth entry by its ID.
@@ -2526,6 +2574,36 @@ func (m *Manager) StopAutoRefresh() {
 		m.refreshCancel()
 		m.refreshCancel = nil
 	}
+	if m.rpmCleanupEnd != nil {
+		m.rpmCleanupEnd()
+		m.rpmCleanupEnd = nil
+	}
+	if m.rpmLimiter != nil {
+		m.rpmLimiter.Stop()
+	}
+}
+
+func (m *Manager) resolveRPMLimit(auth *Auth) int {
+	defaultRPM := 0
+	if cfg, _ := m.runtimeConfig.Load().(*internalconfig.Config); cfg != nil {
+		defaultRPM = cfg.DefaultRPM
+	}
+	if auth != nil && auth.Attributes != nil {
+		if raw := strings.TrimSpace(auth.Attributes["rpm_limit"]); raw != "" {
+			if parsed, err := strconv.Atoi(raw); err == nil {
+				if parsed > 0 {
+					return parsed
+				}
+				if parsed == 0 {
+					return 0
+				}
+			}
+		}
+	}
+	if defaultRPM > 0 {
+		return defaultRPM
+	}
+	return 0
 }
 
 func (m *Manager) checkRefreshes(ctx context.Context) {

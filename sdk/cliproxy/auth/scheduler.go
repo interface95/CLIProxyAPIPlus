@@ -3,6 +3,7 @@ package auth
 import (
 	"context"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -37,6 +38,8 @@ type authScheduler struct {
 	providers     map[string]*providerScheduler
 	authProviders map[string]string
 	mixedCursors  map[string]int
+	rpmLimiter    *RPMLimiter
+	defaultRPM    int
 }
 
 // providerScheduler stores auth metadata and model shards for a single provider.
@@ -98,12 +101,14 @@ type childBucket struct {
 type cooldownQueue []*scheduledAuth
 
 // newAuthScheduler constructs an empty scheduler configured for the supplied selector strategy.
-func newAuthScheduler(selector Selector) *authScheduler {
+func newAuthScheduler(selector Selector, rpmLimiter *RPMLimiter, defaultRPM int) *authScheduler {
 	return &authScheduler{
 		strategy:      selectorStrategy(selector),
 		providers:     make(map[string]*providerScheduler),
 		authProviders: make(map[string]string),
 		mixedCursors:  make(map[string]int),
+		rpmLimiter:    rpmLimiter,
+		defaultRPM:    defaultRPM,
 	}
 }
 
@@ -128,6 +133,15 @@ func (s *authScheduler) setSelector(selector Selector) {
 	defer s.mu.Unlock()
 	s.strategy = selectorStrategy(selector)
 	clear(s.mixedCursors)
+}
+
+func (s *authScheduler) setDefaultRPM(defaultRPM int) {
+	if s == nil {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.defaultRPM = defaultRPM
 }
 
 // rebuild recreates the complete scheduler state from an auth snapshot.
@@ -234,7 +248,7 @@ func (s *authScheduler) pickMixed(ctx context.Context, providers []string, model
 			return nil, "", &Error{Code: "auth_not_found", Message: "no auth available"}
 		}
 		shard := providerState.ensureModelLocked(modelKey, time.Now())
-		predicate := func(entry *scheduledAuth) bool {
+		basePredicate := func(entry *scheduledAuth) bool {
 			if entry == nil || entry.auth == nil || entry.auth.ID != pinnedAuthID {
 				return false
 			}
@@ -244,13 +258,39 @@ func (s *authScheduler) pickMixed(ctx context.Context, providers []string, model
 			_, ok := tried[pinnedAuthID]
 			return !ok
 		}
+		predicate := func(entry *scheduledAuth) bool {
+			if !basePredicate(entry) {
+				return false
+			}
+			if s.rpmLimiter == nil || entry == nil || entry.auth == nil {
+				return true
+			}
+			limit := s.resolveRPMLimit(entry.auth)
+			if limit == 0 {
+				return true
+			}
+			return s.rpmLimiter.Count(entry.auth.ID) < limit
+		}
 		if picked := shard.pickReadyLocked(false, s.strategy, predicate); picked != nil {
 			return picked, providerKey, nil
 		}
 		return nil, "", shard.unavailableErrorLocked("mixed", model, predicate)
 	}
 
-	predicate := triedPredicate(tried)
+	basePredicate := triedPredicate(tried)
+	predicate := func(entry *scheduledAuth) bool {
+		if !basePredicate(entry) {
+			return false
+		}
+		if s.rpmLimiter == nil || entry == nil || entry.auth == nil {
+			return true
+		}
+		limit := s.resolveRPMLimit(entry.auth)
+		if limit == 0 {
+			return true
+		}
+		return s.rpmLimiter.Count(entry.auth.ID) < limit
+	}
 	candidateShards := make([]*modelScheduler, len(normalized))
 	bestPriority := 0
 	hasCandidate := false
@@ -312,6 +352,25 @@ func (s *authScheduler) pickMixed(ctx context.Context, providers []string, model
 		return picked, providerKey, nil
 	}
 	return nil, "", s.mixedUnavailableErrorLocked(normalized, model, tried)
+}
+
+func (s *authScheduler) resolveRPMLimit(auth *Auth) int {
+	if auth != nil && auth.Attributes != nil {
+		if raw := strings.TrimSpace(auth.Attributes["rpm_limit"]); raw != "" {
+			if parsed, err := strconv.Atoi(raw); err == nil {
+				if parsed > 0 {
+					return parsed
+				}
+				if parsed == 0 {
+					return 0
+				}
+			}
+		}
+	}
+	if s != nil && s.defaultRPM > 0 {
+		return s.defaultRPM
+	}
+	return 0
 }
 
 // mixedUnavailableErrorLocked synthesizes the mixed-provider cooldown or unavailable error.

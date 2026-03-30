@@ -92,6 +92,10 @@ max-retry-credentials: 0
 # Maximum wait time in seconds for a cooled-down credential before triggering a retry.
 max-retry-interval: 30
 
+# Maximum requests per minute per credential (0 = unlimited, default: 0)
+# Individual credentials can override via auth attributes: rpm_limit
+default-rpm: 0
+
 # Quota exceeded behavior
 quota-exceeded:
   switch-project: true # Whether to automatically switch to another project when a quota is exceeded
