@@ -19,6 +19,9 @@ Add to your `config.yaml`:
 ```yaml
 # Global default: max requests per minute per credential (0 = unlimited)
 default-rpm: 60
+
+# Global default: max concurrent in-flight requests per credential (0 = unlimited)
+default-max-concurrent: 10
 ```
 
 ### Per-Credential Override
@@ -53,7 +56,8 @@ When `rpm_limit` is set on a credential, it takes priority over the global `defa
 ### How It Works
 
 - **Sliding window algorithm**: Tracks request timestamps within a 60-second window per credential
-- **Scheduler integration**: RPM-exhausted credentials are automatically skipped during selection
+- **Concurrency control**: Limits simultaneous in-flight requests per credential (acquire on start, release on finish)
+- **Scheduler integration**: RPM-exhausted or concurrency-full credentials are automatically skipped during selection
 - **Conductor double-check**: A secondary check before execution ensures concurrency safety
 - **Automatic recovery**: Credentials become available again once requests slide out of the window
 - **Zero config default**: `rpm_limit=0` or unset means unlimited (fully backward compatible)
@@ -63,24 +67,31 @@ When `rpm_limit` is set on a credential, it takes priority over the global `defa
 | Config | Location | Type | Default | Description |
 |--------|----------|------|---------|-------------|
 | `default-rpm` | `config.yaml` | int | `0` | Global default RPM limit for all credentials. `0` = unlimited |
-| `rpm_limit` | credential attributes | string | — | Per-credential override. Takes priority over `default-rpm` |
+| `rpm_limit` | credential attributes | string | — | Per-credential RPM override. Takes priority over `default-rpm` |
+| `default-max-concurrent` | `config.yaml` | int | `0` | Global default max concurrent in-flight requests per credential. `0` = unlimited |
+| `max_concurrent` | credential attributes | string | — | Per-credential concurrency override. Takes priority over `default-max-concurrent` |
 
 ### Management API
 
-Query current RPM status for all credentials:
+Query current rate limiting status:
 
 ```bash
-GET /v0/management/rpm-stats
+GET /v0/management/rpm-stats            # RPM status per credential
+GET /v0/management/concurrency-stats    # Concurrent in-flight requests per credential
 ```
-
-Returns each credential's current request count, configured limit, and retry-after duration.
 
 ### Observability
 
-When a credential hits its RPM limit, a warning log is emitted:
+When a credential hits its RPM limit:
 
 ```
 WARN RPM limit reached for credential  auth_id=xxx provider=gemini rpm_limit=60 current_rpm=60 retry_after_seconds=45
+```
+
+When a credential hits its concurrency limit:
+
+```
+WARN Concurrency limit reached for credential  auth_id=xxx provider=gemini max_concurrent=10 current=10
 ```
 
 ## Contributing
