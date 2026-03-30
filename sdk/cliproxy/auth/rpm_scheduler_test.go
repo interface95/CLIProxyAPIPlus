@@ -14,7 +14,7 @@ func TestScheduler_SkipsRPMBlocked(t *testing.T) {
 
 	clk := newManualClock(time.Unix(0, 0))
 	limiter := NewRPMLimiter(WithClock(clk.Now))
-	scheduler := newAuthScheduler(&RoundRobinSelector{}, limiter, 0)
+	scheduler := newAuthScheduler(&RoundRobinSelector{}, limiter, 0, nil, 0)
 	scheduler.rebuild([]*Auth{
 		{ID: "auth-1", Provider: "gemini", Attributes: map[string]string{"rpm_limit": "2"}},
 		{ID: "auth-2", Provider: "gemini", Attributes: map[string]string{"rpm_limit": "2"}},
@@ -47,7 +47,7 @@ func TestScheduler_AllRPMBlocked(t *testing.T) {
 
 	clk := newManualClock(time.Unix(0, 0))
 	limiter := NewRPMLimiter(WithClock(clk.Now))
-	scheduler := newAuthScheduler(&RoundRobinSelector{}, limiter, 0)
+	scheduler := newAuthScheduler(&RoundRobinSelector{}, limiter, 0, nil, 0)
 	scheduler.rebuild([]*Auth{
 		{ID: "auth-a", Provider: "gemini", Attributes: map[string]string{"rpm_limit": "1"}},
 		{ID: "auth-b", Provider: "gemini", Attributes: map[string]string{"rpm_limit": "1"}},
@@ -89,7 +89,7 @@ func TestScheduler_NoRPMLimitUnaffected(t *testing.T) {
 
 	clk := newManualClock(time.Unix(0, 0))
 	limiter := NewRPMLimiter(WithClock(clk.Now))
-	scheduler := newAuthScheduler(&RoundRobinSelector{}, limiter, 0)
+	scheduler := newAuthScheduler(&RoundRobinSelector{}, limiter, 0, nil, 0)
 	scheduler.rebuild([]*Auth{{ID: "auth-unlimited", Provider: "gemini"}})
 
 	for i := 0; i < 100; i++ {

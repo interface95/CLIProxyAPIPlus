@@ -17,7 +17,7 @@ func TestIntegration_RPM_MultiCredentialRotation(t *testing.T) {
 	authB := &Auth{ID: "auth-B", Provider: "gemini", Attributes: map[string]string{"rpm_limit": "5"}}
 	authC := &Auth{ID: "auth-C", Provider: "gemini"}
 
-	scheduler := newAuthScheduler(&RoundRobinSelector{}, limiter, 0)
+	scheduler := newAuthScheduler(&RoundRobinSelector{}, limiter, 0, nil, 0)
 	scheduler.rebuild([]*Auth{authA, authB, authC})
 
 	// auth-A: 前 2 次 Allow 应成功
@@ -81,7 +81,7 @@ func TestIntegration_RPM_AllBlocked(t *testing.T) {
 	authA := &Auth{ID: "auth-X", Provider: "gemini", Attributes: map[string]string{"rpm_limit": "1"}}
 	authB := &Auth{ID: "auth-Y", Provider: "gemini", Attributes: map[string]string{"rpm_limit": "1"}}
 
-	scheduler := newAuthScheduler(&RoundRobinSelector{}, limiter, 0)
+	scheduler := newAuthScheduler(&RoundRobinSelector{}, limiter, 0, nil, 0)
 	scheduler.rebuild([]*Auth{authA, authB})
 
 	limitA := scheduler.resolveRPMLimit(authA)
@@ -125,7 +125,7 @@ func TestIntegration_RPM_DefaultRPMFallback(t *testing.T) {
 	authNoLimit := &Auth{ID: "auth-nolimit", Provider: "gemini"}
 
 	// scheduler.defaultRPM = 3
-	scheduler := newAuthScheduler(&RoundRobinSelector{}, limiter, 3)
+	scheduler := newAuthScheduler(&RoundRobinSelector{}, limiter, 3, nil, 0)
 	scheduler.rebuild([]*Auth{authNoLimit})
 
 	// resolveRPMLimit 应返回 defaultRPM=3

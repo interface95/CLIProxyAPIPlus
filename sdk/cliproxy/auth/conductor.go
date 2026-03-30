@@ -155,9 +155,10 @@ type Manager struct {
 
 	// runtimeConfig stores the latest application config for request-time decisions.
 	// It is initialized in NewManager; never Load() before first Store().
-	runtimeConfig atomic.Value
-	rpmLimiter    *RPMLimiter
-	rpmCleanupEnd context.CancelFunc
+	runtimeConfig      atomic.Value
+	rpmLimiter         *RPMLimiter
+	concurrencyLimiter *ConcurrencyLimiter
+	rpmCleanupEnd      context.CancelFunc
 
 	// Optional HTTP RoundTripper provider injected by host.
 	rtProvider RoundTripperProvider
@@ -176,25 +177,27 @@ func NewManager(store Store, selector Selector, hook Hook) *Manager {
 		hook = NoopHook{}
 	}
 	limiter := NewRPMLimiter()
+	concurrencyLimiter := NewConcurrencyLimiter()
 	rpmCleanupCtx, rpmCleanupEnd := context.WithCancel(context.Background())
 	limiter.StartCleanup(rpmCleanupCtx)
 
 	manager := &Manager{
-		store:            store,
-		executors:        make(map[string]ProviderExecutor),
-		selector:         selector,
-		hook:             hook,
-		auths:            make(map[string]*Auth),
-		providerOffsets:  make(map[string]int),
-		modelPoolOffsets: make(map[string]int),
-		refreshSemaphore: make(chan struct{}, refreshMaxConcurrency),
-		rpmLimiter:       limiter,
-		rpmCleanupEnd:    rpmCleanupEnd,
+		store:              store,
+		executors:          make(map[string]ProviderExecutor),
+		selector:           selector,
+		hook:               hook,
+		auths:              make(map[string]*Auth),
+		providerOffsets:    make(map[string]int),
+		modelPoolOffsets:   make(map[string]int),
+		refreshSemaphore:   make(chan struct{}, refreshMaxConcurrency),
+		rpmLimiter:         limiter,
+		concurrencyLimiter: concurrencyLimiter,
+		rpmCleanupEnd:      rpmCleanupEnd,
 	}
 	// atomic.Value requires non-nil initial value.
 	manager.runtimeConfig.Store(&internalconfig.Config{})
 	manager.apiKeyModelAlias.Store(apiKeyModelAliasTable(nil))
-	manager.scheduler = newAuthScheduler(selector, limiter, 0)
+	manager.scheduler = newAuthScheduler(selector, limiter, 0, concurrencyLimiter, 0)
 	return manager
 }
 
@@ -283,6 +286,7 @@ func (m *Manager) SetConfig(cfg *internalconfig.Config) {
 	m.runtimeConfig.Store(cfg)
 	if m.scheduler != nil {
 		m.scheduler.setDefaultRPM(cfg.DefaultRPM)
+		m.scheduler.setDefaultMaxConcurrent(cfg.DefaultMaxConcurrent)
 	}
 	m.rebuildAPIKeyModelAliasFromRuntimeConfig()
 }
@@ -1113,54 +1117,83 @@ func (m *Manager) executeMixedOnce(ctx context.Context, providers []string, req 
 			continue
 		}
 
-		entry := logEntryWithRequestID(ctx)
-		debugLogAuthSelection(entry, auth, provider, req.Model)
-		publishSelectedAuthMetadata(opts.Metadata, auth.ID)
-
-		tried[auth.ID] = struct{}{}
-		execCtx := ctx
-		if rt := m.roundTripperFor(auth); rt != nil {
-			execCtx = context.WithValue(execCtx, roundTripperContextKey{}, rt)
-			execCtx = context.WithValue(execCtx, "cliproxy.roundtripper", rt)
-		}
-
-		models, pooled := m.preparedExecutionModels(auth, routeModel)
-		if len(models) == 0 {
+		concLimit := m.resolveConcurrencyLimit(auth)
+		if concLimit > 0 && m.concurrencyLimiter != nil && !m.concurrencyLimiter.Acquire(auth.ID, concLimit) {
+			log.WithFields(log.Fields{
+				"auth_id":        auth.ID,
+				"provider":       provider,
+				"max_concurrent": concLimit,
+				"current":        m.concurrencyLimiter.Count(auth.ID),
+			}).Warn("Concurrency limit reached for credential")
+			tried[auth.ID] = struct{}{}
 			continue
 		}
-		attempted[auth.ID] = struct{}{}
-		var authErr error
-		for _, upstreamModel := range models {
-			resultModel := executionResultModel(routeModel, upstreamModel, pooled)
-			execReq := req
-			execReq.Model = upstreamModel
-			resp, errExec := executor.Execute(execCtx, auth, execReq, opts)
-			result := Result{AuthID: auth.ID, Provider: provider, Model: resultModel, Success: errExec == nil}
-			if errExec != nil {
-				if errCtx := execCtx.Err(); errCtx != nil {
-					return cliproxyexecutor.Response{}, errCtx
-				}
-				result.Error = &Error{Message: errExec.Error()}
-				if se, ok := errors.AsType[cliproxyexecutor.StatusError](errExec); ok && se != nil {
-					result.Error.HTTPStatus = se.StatusCode()
-				}
-				if ra := retryAfterFromError(errExec); ra != nil {
-					result.RetryAfter = ra
+
+		resp, shouldReturn, returnErr, authErr := func() (cliproxyexecutor.Response, bool, error, error) {
+			if concLimit > 0 && m.concurrencyLimiter != nil {
+				defer m.concurrencyLimiter.Release(auth.ID)
+			}
+
+			entry := logEntryWithRequestID(ctx)
+			debugLogAuthSelection(entry, auth, provider, req.Model)
+			publishSelectedAuthMetadata(opts.Metadata, auth.ID)
+
+			tried[auth.ID] = struct{}{}
+			execCtx := ctx
+			if rt := m.roundTripperFor(auth); rt != nil {
+				execCtx = context.WithValue(execCtx, roundTripperContextKey{}, rt)
+				execCtx = context.WithValue(execCtx, "cliproxy.roundtripper", rt)
+			}
+
+			models, pooled := m.preparedExecutionModels(auth, routeModel)
+			if len(models) == 0 {
+				return cliproxyexecutor.Response{}, false, nil, nil
+			}
+			attempted[auth.ID] = struct{}{}
+			var localAuthErr error
+			for _, upstreamModel := range models {
+				resultModel := executionResultModel(routeModel, upstreamModel, pooled)
+				execReq := req
+				execReq.Model = upstreamModel
+				resp, errExec := executor.Execute(execCtx, auth, execReq, opts)
+				result := Result{AuthID: auth.ID, Provider: provider, Model: resultModel, Success: errExec == nil}
+				if errExec != nil {
+					if errCtx := execCtx.Err(); errCtx != nil {
+						return cliproxyexecutor.Response{}, true, errCtx, nil
+					}
+					result.Error = &Error{Message: errExec.Error()}
+					if se, ok := errors.AsType[cliproxyexecutor.StatusError](errExec); ok && se != nil {
+						result.Error.HTTPStatus = se.StatusCode()
+					}
+					if ra := retryAfterFromError(errExec); ra != nil {
+						result.RetryAfter = ra
+					}
+					m.MarkResult(execCtx, result)
+					if isRequestInvalidError(errExec) {
+						return cliproxyexecutor.Response{}, true, errExec, nil
+					}
+					localAuthErr = errExec
+					continue
 				}
 				m.MarkResult(execCtx, result)
-				if isRequestInvalidError(errExec) {
-					return cliproxyexecutor.Response{}, errExec
-				}
-				authErr = errExec
-				continue
+				return resp, true, nil, nil
 			}
-			m.MarkResult(execCtx, result)
+			if localAuthErr != nil {
+				if isRequestInvalidError(localAuthErr) {
+					return cliproxyexecutor.Response{}, true, localAuthErr, nil
+				}
+				return cliproxyexecutor.Response{}, false, nil, localAuthErr
+			}
+			return cliproxyexecutor.Response{}, false, nil, nil
+		}()
+
+		if shouldReturn {
+			if returnErr != nil {
+				return cliproxyexecutor.Response{}, returnErr
+			}
 			return resp, nil
 		}
 		if authErr != nil {
-			if isRequestInvalidError(authErr) {
-				return cliproxyexecutor.Response{}, authErr
-			}
 			lastErr = authErr
 			continue
 		}
@@ -2210,6 +2243,13 @@ func (m *Manager) RPMStats() map[string]RPMStats {
 	})
 }
 
+func (m *Manager) ConcurrencyStats() map[string]int {
+	if m == nil || m.concurrencyLimiter == nil {
+		return map[string]int{}
+	}
+	return m.concurrencyLimiter.Stats()
+}
+
 // GetByID retrieves an auth entry by its ID.
 
 func (m *Manager) GetByID(id string) (*Auth, bool) {
@@ -2604,6 +2644,33 @@ func (m *Manager) resolveRPMLimit(auth *Auth) int {
 		return defaultRPM
 	}
 	return 0
+}
+
+func resolveConcurrencyLimit(auth *Auth, defaultLimit int) int {
+	if auth != nil && auth.Attributes != nil {
+		if raw := strings.TrimSpace(auth.Attributes["max_concurrent"]); raw != "" {
+			if parsed, err := strconv.Atoi(raw); err == nil {
+				if parsed > 0 {
+					return parsed
+				}
+				if parsed == 0 {
+					return 0
+				}
+			}
+		}
+	}
+	if defaultLimit > 0 {
+		return defaultLimit
+	}
+	return 0
+}
+
+func (m *Manager) resolveConcurrencyLimit(auth *Auth) int {
+	defaultLimit := 0
+	if cfg, _ := m.runtimeConfig.Load().(*internalconfig.Config); cfg != nil {
+		defaultLimit = cfg.DefaultMaxConcurrent
+	}
+	return resolveConcurrencyLimit(auth, defaultLimit)
 }
 
 func (m *Manager) checkRefreshes(ctx context.Context) {

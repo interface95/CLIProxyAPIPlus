@@ -33,13 +33,15 @@ const (
 
 // authScheduler keeps the incremental provider/model scheduling state used by Manager.
 type authScheduler struct {
-	mu            sync.Mutex
-	strategy      schedulerStrategy
-	providers     map[string]*providerScheduler
-	authProviders map[string]string
-	mixedCursors  map[string]int
-	rpmLimiter    *RPMLimiter
-	defaultRPM    int
+	mu                   sync.Mutex
+	strategy             schedulerStrategy
+	providers            map[string]*providerScheduler
+	authProviders        map[string]string
+	mixedCursors         map[string]int
+	rpmLimiter           *RPMLimiter
+	defaultRPM           int
+	concurrencyLimiter   *ConcurrencyLimiter
+	defaultMaxConcurrent int
 }
 
 // providerScheduler stores auth metadata and model shards for a single provider.
@@ -101,14 +103,16 @@ type childBucket struct {
 type cooldownQueue []*scheduledAuth
 
 // newAuthScheduler constructs an empty scheduler configured for the supplied selector strategy.
-func newAuthScheduler(selector Selector, rpmLimiter *RPMLimiter, defaultRPM int) *authScheduler {
+func newAuthScheduler(selector Selector, rpmLimiter *RPMLimiter, defaultRPM int, concurrencyLimiter *ConcurrencyLimiter, defaultMaxConcurrent int) *authScheduler {
 	return &authScheduler{
-		strategy:      selectorStrategy(selector),
-		providers:     make(map[string]*providerScheduler),
-		authProviders: make(map[string]string),
-		mixedCursors:  make(map[string]int),
-		rpmLimiter:    rpmLimiter,
-		defaultRPM:    defaultRPM,
+		strategy:             selectorStrategy(selector),
+		providers:            make(map[string]*providerScheduler),
+		authProviders:        make(map[string]string),
+		mixedCursors:         make(map[string]int),
+		rpmLimiter:           rpmLimiter,
+		defaultRPM:           defaultRPM,
+		concurrencyLimiter:   concurrencyLimiter,
+		defaultMaxConcurrent: defaultMaxConcurrent,
 	}
 }
 
@@ -142,6 +146,15 @@ func (s *authScheduler) setDefaultRPM(defaultRPM int) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.defaultRPM = defaultRPM
+}
+
+func (s *authScheduler) setDefaultMaxConcurrent(defaultMaxConcurrent int) {
+	if s == nil {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.defaultMaxConcurrent = defaultMaxConcurrent
 }
 
 // rebuild recreates the complete scheduler state from an auth snapshot.
@@ -262,14 +275,22 @@ func (s *authScheduler) pickMixed(ctx context.Context, providers []string, model
 			if !basePredicate(entry) {
 				return false
 			}
-			if s.rpmLimiter == nil || entry == nil || entry.auth == nil {
-				return true
+			if entry == nil || entry.auth == nil {
+				return false
 			}
-			limit := s.resolveRPMLimit(entry.auth)
-			if limit == 0 {
-				return true
+			if s.rpmLimiter != nil {
+				limit := s.resolveRPMLimit(entry.auth)
+				if limit > 0 && s.rpmLimiter.Count(entry.auth.ID) >= limit {
+					return false
+				}
 			}
-			return s.rpmLimiter.Count(entry.auth.ID) < limit
+			if s.concurrencyLimiter != nil {
+				concLimit := s.resolveConcurrencyLimit(entry.auth)
+				if concLimit > 0 && s.concurrencyLimiter.Count(entry.auth.ID) >= concLimit {
+					return false
+				}
+			}
+			return true
 		}
 		if picked := shard.pickReadyLocked(false, s.strategy, predicate); picked != nil {
 			return picked, providerKey, nil
@@ -282,14 +303,22 @@ func (s *authScheduler) pickMixed(ctx context.Context, providers []string, model
 		if !basePredicate(entry) {
 			return false
 		}
-		if s.rpmLimiter == nil || entry == nil || entry.auth == nil {
-			return true
+		if entry == nil || entry.auth == nil {
+			return false
 		}
-		limit := s.resolveRPMLimit(entry.auth)
-		if limit == 0 {
-			return true
+		if s.rpmLimiter != nil {
+			limit := s.resolveRPMLimit(entry.auth)
+			if limit > 0 && s.rpmLimiter.Count(entry.auth.ID) >= limit {
+				return false
+			}
 		}
-		return s.rpmLimiter.Count(entry.auth.ID) < limit
+		if s.concurrencyLimiter != nil {
+			concLimit := s.resolveConcurrencyLimit(entry.auth)
+			if concLimit > 0 && s.concurrencyLimiter.Count(entry.auth.ID) >= concLimit {
+				return false
+			}
+		}
+		return true
 	}
 	candidateShards := make([]*modelScheduler, len(normalized))
 	bestPriority := 0
@@ -369,6 +398,25 @@ func (s *authScheduler) resolveRPMLimit(auth *Auth) int {
 	}
 	if s != nil && s.defaultRPM > 0 {
 		return s.defaultRPM
+	}
+	return 0
+}
+
+func (s *authScheduler) resolveConcurrencyLimit(auth *Auth) int {
+	if auth != nil && auth.Attributes != nil {
+		if raw := strings.TrimSpace(auth.Attributes["max_concurrent"]); raw != "" {
+			if parsed, err := strconv.Atoi(raw); err == nil {
+				if parsed > 0 {
+					return parsed
+				}
+				if parsed == 0 {
+					return 0
+				}
+			}
+		}
+	}
+	if s != nil && s.defaultMaxConcurrent > 0 {
+		return s.defaultMaxConcurrent
 	}
 	return 0
 }

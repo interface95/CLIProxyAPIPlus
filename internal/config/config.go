@@ -77,7 +77,8 @@ type Config struct {
 	MaxRetryInterval int `yaml:"max-retry-interval" json:"max-retry-interval"`
 	// DefaultRPM defines the default maximum requests per minute per credential.
 	// Set to 0 (default) for unlimited. Individual credentials can override via auth attributes: rpm_limit.
-	DefaultRPM int `yaml:"default-rpm" json:"default-rpm"`
+	DefaultRPM           int `yaml:"default-rpm" json:"default-rpm"`
+	DefaultMaxConcurrent int `yaml:"default-max-concurrent" json:"default-max-concurrent"`
 
 	// QuotaExceeded defines the behavior when a quota is exceeded.
 	QuotaExceeded QuotaExceeded `yaml:"quota-exceeded" json:"quota-exceeded"`

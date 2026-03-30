@@ -96,6 +96,10 @@ max-retry-interval: 30
 # Individual credentials can override via auth attributes: rpm_limit
 default-rpm: 0
 
+# Maximum concurrent in-flight requests per credential (0 = unlimited, default: 0)
+# Individual credentials can override via auth attributes: max_concurrent
+default-max-concurrent: 0
+
 # Quota exceeded behavior
 quota-exceeded:
   switch-project: true # Whether to automatically switch to another project when a quota is exceeded
